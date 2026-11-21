@@ -458,3 +458,5 @@ BrandBlitz operates both a **hot wallet model** (default, off-chain) and this **
 | Requires Rust/Soroban | No                                          | Yes                        |
 
 The hot wallet model is simpler to operate and is the default for new challenges. The Soroban contract provides a trustless alternative for brands that want full on-chain transparency.
+
+

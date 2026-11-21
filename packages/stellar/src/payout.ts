@@ -5,8 +5,7 @@ import {
   Operation,
   Memo,
   BASE_FEE,
-  FeeBumpTransaction,
-  TransactionEnvelope,
+  Transaction,
 } from "@stellar/stellar-sdk";
 import {
   getHorizonServer,
@@ -14,7 +13,6 @@ import {
   getNetworkPassphrase,
   withRetry,
   type NetworkName,
-  type RetryOptions,
 } from "./client";
 import { MAX_OPS_PER_TX, PAYOUT_BATCH_DELAY_MS } from "./constants";
 import { warn } from "./logger";
@@ -43,6 +41,14 @@ export interface SubmitBatchPayoutOptions {
   onSequenceReset?: (info: SequenceResetInfo) => void | Promise<void>;
   maxBadSeqRetries?: number;
   onInvalidRecipient?: (recipient: PayoutRecipient, reason: string) => void;
+  /**
+   * When true, a batch rejected with `tx_insufficient_fee` is recovered by wrapping the
+   * rejected transaction in a fee bump and submitting that instead. Off by default so
+   * existing callers keep their current behaviour.
+   */
+  feeBumpOnInsufficientFee?: boolean;
+  /** Maximum automatic fee-bump attempts per batch. Defaults to 2. */
+  maxFeeBumpRetries?: number;
 }
 
 /**
@@ -64,6 +70,7 @@ export async function submitBatchPayout(
   const hotKeypair = Keypair.fromSecret(hotWalletSecret);
   const sequenceKeyPrefix = buildSequenceKeyPrefix(network, hotKeypair.publicKey());
   const maxBadSeqRetries = options.maxBadSeqRetries ?? 1;
+  const maxFeeBumpRetries = options.maxFeeBumpRetries ?? 2;
 
   const loadBaseSequence = async () => {
     const account = await horizon.loadAccount(hotKeypair.publicKey());
@@ -91,8 +98,10 @@ export async function submitBatchPayout(
   for (let i = 0; i < batches.length; i++) {
     const batch = batches[i];
     let attempts = 0;
+    let feeBumpAttempts = 0;
 
     while (attempts <= maxBadSeqRetries) {
+      let builtTx: Transaction | undefined;
       try {
         const sourceAccount = options.sequenceStore
           ? new Account(
@@ -124,7 +133,7 @@ export async function submitBatchPayout(
           );
         }
 
-        const builtTx = tx.build();
+        builtTx = tx.build() as Transaction;
         builtTx.sign(hotKeypair);
 
         const response = await withRetry(() => horizon.submitTransaction(builtTx), {
@@ -153,12 +162,45 @@ export async function submitBatchPayout(
           continue;
         }
 
-        results.push({
-          txHash: "",
-          recipients: batch,
-          success: false,
-          error: err?.message ?? "Unknown error",
-        });
+        // Fee-rate rejection: the built transaction never reached the ledger, so wrap it
+        // directly in a fee bump instead of re-building it (which would need a new sequence).
+        let failure: any = err;
+        let recovered = false;
+        while (
+          options.feeBumpOnInsufficientFee &&
+          builtTx &&
+          isInsufficientFeeError(failure) &&
+          feeBumpAttempts < maxFeeBumpRetries
+        ) {
+          feeBumpAttempts += 1;
+          try {
+            const bumped = await submitFeeBump(
+              builtTx,
+              feeBumpFeeStroops(batch.length, feeBumpAttempts),
+              hotKeypair,
+              horizon,
+              passphrase
+            );
+            results.push({
+              txHash: bumped.feeBumpHash,
+              recipients: batch,
+              success: true,
+            });
+            recovered = true;
+            break;
+          } catch (bumpErr: any) {
+            failure = bumpErr;
+          }
+        }
+
+        if (!recovered) {
+          results.push({
+            txHash: "",
+            recipients: batch,
+            success: false,
+            error: failure?.message ?? "Unknown error",
+          });
+        }
         break;
       }
     }
@@ -266,6 +308,7 @@ export async function feeBumpTransaction(
   network: NetworkName = "testnet"
 ): Promise<{ txHash: string; feeBumpHash: string }> {
   const horizon = getHorizonServer(network);
+  const passphrase = getNetworkPassphrase(network);
   const hotKeypair = Keypair.fromSecret(hotWalletSecret);
 
   // Retrieve the original transaction from Stellar
@@ -286,43 +329,59 @@ export async function feeBumpTransaction(
     throw new Error(`Transaction ${originalTxHash} not found on Stellar`);
   }
 
-  // Decode the original transaction envelope
-  let originalEnvelope: TransactionEnvelope;
+  // Decode the original transaction envelope into a Transaction the SDK can wrap
+  let innerTx: Transaction;
   try {
-    originalEnvelope = TransactionEnvelope.fromXDR(originalTx.envelope_xdr, "base64");
+    innerTx = new Transaction(originalTx.envelope_xdr, passphrase);
   } catch (err) {
     throw new Error(`Failed to decode transaction XDR: ${(err as Error).message}`);
   }
 
-  // Create fee bump transaction wrapping the original
-  // Fee bump fee is total for the operation, not per operation
-  const innerTx = originalEnvelope.v1()?.tx() ?? originalEnvelope.v0()?.tx();
+  const result = await submitFeeBump(innerTx, newMaxFeeStroops, hotKeypair, horizon, passphrase);
 
-  if (!innerTx) {
-    throw new Error("Could not extract inner transaction from envelope");
-  }
+  return {
+    txHash: originalTxHash,
+    feeBumpHash: result.feeBumpHash,
+  };
+}
 
-  const feeBumpTx = new FeeBumpTransaction({
-    fee: newMaxFeeStroops,
-    feeSource: hotKeypair.publicKey(),
+/**
+ * Fee-bump fee for a batch. The fee bump covers the inner operations plus itself,
+ * so the total scales with (operations + 1) and doubles on each automatic attempt.
+ */
+function feeBumpFeeStroops(operationCount: number, attempt: number): number {
+  return (operationCount + 1) * Number(BASE_FEE) * 2 ** attempt;
+}
+
+/**
+ * Wrap an already-built inner transaction in a fee bump signed by the hot wallet and submit it.
+ * Shared by feeBumpTransaction (for a tx found on-chain) and submitBatchPayout (for a tx
+ * rejected with tx_insufficient_fee, which never reaches the ledger).
+ */
+async function submitFeeBump(
+  innerTx: Transaction,
+  newMaxFeeStroops: number,
+  hotKeypair: Keypair,
+  horizon: ReturnType<typeof getHorizonServer>,
+  passphrase: string
+): Promise<{ feeBumpHash: string }> {
+  // newMaxFeeStroops is the total fee; the SDK takes a per-operation base fee
+  const perOpFee = Math.ceil(newMaxFeeStroops / (innerTx.operations.length + 1));
+
+  const feeBumpTx = TransactionBuilder.buildFeeBumpTransaction(
+    hotKeypair,
+    perOpFee.toString(),
     innerTx,
-  });
+    passphrase
+  );
 
-  // Create a new fee bump transaction envelope
-  const feeBumpEnvelope = new TransactionEnvelope(feeBumpTx, []);
+  feeBumpTx.sign(hotKeypair);
 
-  // Sign the fee bump envelope
-  feeBumpEnvelope.sign(hotKeypair);
-
-  // Submit fee bump to Stellar
-  const result = await withRetry(() => horizon.submitTransaction(feeBumpEnvelope), {
+  const result = await withRetry(() => horizon.submitTransaction(feeBumpTx), {
     maxAttempts: 5,
     baseDelayMs: 250,
     maxDelayMs: 30_000,
   });
 
-  return {
-    txHash: originalTxHash,
-    feeBumpHash: result.hash,
-  };
+  return { feeBumpHash: result.hash };
 }

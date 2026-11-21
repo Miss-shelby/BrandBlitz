@@ -1,10 +1,12 @@
 import {
   Address,
+  authorizeEntry,
   Contract,
   Keypair,
   Networks,
   Operation,
   SorobanDataBuilder,
+  Transaction,
   TransactionBuilder,
   nativeToScVal,
   scValToNative,
@@ -13,6 +15,9 @@ import {
 import { Server as HorizonServer } from "@stellar/stellar-sdk/lib/horizon";
 import { Server as SorobanServer } from "@stellar/stellar-sdk/lib/soroban";
 import { withRetry, type RetryOptions } from "./client";
+
+/** How many ledgers a signed Soroban address authorization stays valid for. */
+const AUTH_ENTRY_VALIDITY_LEDGERS = 100;
 
 export interface EscrowRecipient {
   address: string;
@@ -104,8 +109,8 @@ export class EscrowClient {
       .setTimeout(300)
       .build();
 
-    tx.sign(signer);
-    const result = await withRetry(() => this.sorobanServer.sendTransaction(tx), {
+    const prepared = await this.prepareAndSign(tx, signer, "Initialize");
+    const result = await withRetry(() => this.sorobanServer.sendTransaction(prepared), {
       maxAttempts: 5,
       baseDelayMs: 250,
       maxDelayMs: 30_000,
@@ -122,6 +127,9 @@ export class EscrowClient {
    * Deposit USDC into the escrow contract.
    * Called by the brand to fund the prize pool.
    *
+   * The authorization entries are not hand-built: simulation reports the
+   * entries the contract requires, and each depositor entry is signed through
+   * the SDK's authorizeEntry over the real authorization preimage.
    * Authorization: the depositor must sign (`depositor.require_auth()` on the contract),
    * so an explicit address credential is attached.
    *
@@ -144,44 +152,14 @@ export class EscrowClient {
             new Address(depositor).toScVal(),
             nativeToScVal(Number(amountStroops), { type: "i128" })
           ),
-          auth: [
-            {
-              credentials: xdr.SorobanCredentials.sorobanAddressCredentials(
-                new Address(depositor).toScVal(),
-                BigInt(0),
-                xdr.Int64.fromString("0"),
-                xdr.SignerKey.signerKeyTypeEd25519(Keypair.fromSecret(signerSecret).rawPublicKey()),
-                xdr.Int64.fromString("0"),
-                xdr.SorobanSignaturePayload.sorobanSignaturePayloadEnvelope(
-                  xdr.EnvelopeTypeTx.txTypeTransaction(),
-                  xdr.TransactionEnvelope.txTypeV0(
-                    xdr.TransactionV0Envelope.create({
-                      tx: xdr.TransactionV0.create({
-                        sourceAccountEd25519: Keypair.fromSecret(signerSecret).rawPublicKey(),
-                        fee: 100000,
-                        seqNum: xdr.SequenceNumber.create(BigInt(0)),
-                        timeBounds: xdr.TimeBounds.create({
-                          minTime: xdr.Uint64.fromString("0"),
-                          maxTime: xdr.Uint64.fromString("0"),
-                        }),
-                        memo: xdr.Memo.memoNone(),
-                        operations: [],
-                        ext: xdr.TransactionV0Ext.v0(),
-                      }),
-                      signatures: [],
-                    })
-                  )
-                )
-              ),
-            },
-          ],
+          auth: [],
         })
       )
       .setTimeout(300)
       .build();
 
-    tx.sign(signer);
-    const result = await withRetry(() => this.sorobanServer.sendTransaction(tx), {
+    const prepared = await this.prepareAndSign(tx, signer, "Deposit");
+    const result = await withRetry(() => this.sorobanServer.sendTransaction(prepared), {
       maxAttempts: 5,
       baseDelayMs: 250,
       maxDelayMs: 30_000,
@@ -228,15 +206,7 @@ export class EscrowClient {
       .setTimeout(300)
       .build();
 
-    // Simulate first: prepareTransaction fills in the admin's authorization entry and the
-    // resource footprint. Not retried, because a simulation failure is deterministic.
-    const prepared = await this.sorobanServer
-      .prepareTransaction(tx)
-      .catch((e: unknown) => {
-        throw explainSimulationError("Settle", e);
-      });
-
-    prepared.sign(signer);
+    const prepared = await this.prepareAndSign(tx, signer, "Settle");
     const result = await withRetry(() => this.sorobanServer.sendTransaction(prepared), {
       maxAttempts: 5,
       baseDelayMs: 250,
@@ -254,8 +224,8 @@ export class EscrowClient {
    * Refund the full balance back to the depositor.
    * Called by admin for cancelled challenges.
    *
-   * Authorization: the contract calls `admin.require_auth()`. This is not yet prepared
-   * by simulation, so it has the same limitation `settle` had before (tracked separately).
+   * Authorization: the contract calls `admin.require_auth()`. The transaction is simulated and
+   * prepared before signing, the same as `settle`.
    *
    * @param signerSecret - Admin hot-wallet secret key for signing
    */
@@ -276,8 +246,8 @@ export class EscrowClient {
       .setTimeout(300)
       .build();
 
-    tx.sign(signer);
-    const result = await withRetry(() => this.sorobanServer.sendTransaction(tx), {
+    const prepared = await this.prepareAndSign(tx, signer, "Refund");
+    const result = await withRetry(() => this.sorobanServer.sendTransaction(prepared), {
       maxAttempts: 5,
       baseDelayMs: 250,
       maxDelayMs: 30_000,
@@ -288,6 +258,73 @@ export class EscrowClient {
     }
 
     return result.hash;
+  }
+
+  /**
+   * Simulate the built transaction, attach the resulting footprint, resource fee and
+   * auth entries, sign the signer's authorizations, then sign the transaction.
+   * Soroban rejects invocations that skip this step.
+   */
+  private async prepareAndSign(tx: Transaction, signer: Keypair, operation: string): Promise<Transaction> {
+    // Not retried: a simulation failure is deterministic. Authorization failures get a readable error.
+    const prepared = (await this.sorobanServer.prepareTransaction(tx).catch((e: unknown) => {
+      throw explainSimulationError(operation, e);
+    })) as Transaction;
+
+    const authorized = await this.authorizeSignerEntries(prepared, signer);
+    authorized.sign(signer);
+    return authorized;
+  }
+
+  /**
+   * Sign every address-credential authorization entry that belongs to the signer.
+   * Entries using source-account credentials are authorized by the transaction signature
+   * itself, so they are left untouched.
+   */
+  private async authorizeSignerEntries(tx: Transaction, signer: Keypair): Promise<Transaction> {
+    const envelope = tx.toEnvelope();
+    let validUntilLedger: number | undefined;
+    let changed = false;
+
+    for (const operation of envelope.v1().tx().operations()) {
+      const body = operation.body();
+      if (body.switch() !== xdr.OperationType.invokeHostFunction()) {
+        continue;
+      }
+
+      const invoke = body.invokeHostFunctionOp();
+      const signedEntries: xdr.SorobanAuthorizationEntry[] = [];
+
+      for (const entry of invoke.auth()) {
+        const credentials = entry.credentials();
+        const isSignerAddress =
+          credentials.switch() === xdr.SorobanCredentialsType.sorobanCredentialsAddress() &&
+          Address.fromScAddress(credentials.address().address()).toString() === signer.publicKey();
+
+        if (!isSignerAddress) {
+          signedEntries.push(entry);
+          continue;
+        }
+
+        if (validUntilLedger === undefined) {
+          const latest = await this.sorobanServer.getLatestLedger();
+          validUntilLedger = latest.sequence + AUTH_ENTRY_VALIDITY_LEDGERS;
+        }
+
+        signedEntries.push(
+          await authorizeEntry(entry, signer, validUntilLedger, this.networkPassphrase)
+        );
+        changed = true;
+      }
+
+      invoke.auth(signedEntries);
+    }
+
+    if (!changed) {
+      return tx;
+    }
+
+    return new Transaction(envelope.toXDR("base64"), this.networkPassphrase);
   }
 
   /**
